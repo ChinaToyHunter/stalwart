@@ -23,6 +23,7 @@ use store::registry::bootstrap::Bootstrap;
 use tokio::{net::TcpStream, sync::watch};
 use tokio_rustls::server::TlsStream;
 use trc::{EventType, HttpEvent, ImapEvent, ManageSieveEvent, Pop3Event, SmtpEvent};
+#[cfg(unix)]
 use utils::UnwrapFailure;
 
 impl Listener {
@@ -326,7 +327,7 @@ impl Listeners {
         }
 
         // Drop privileges
-        #[cfg(not(target_env = "msvc"))]
+        #[cfg(unix)]
         {
             if let Ok(run_as_user) = std::env::var("RUN_AS_USER") {
                 let mut pd = privdrop::PrivDrop::default()

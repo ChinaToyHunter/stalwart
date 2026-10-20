@@ -114,7 +114,7 @@ pub fn failed(message: &str) -> ! {
 }
 
 pub async fn wait_for_shutdown() {
-    #[cfg(not(target_env = "msvc"))]
+    #[cfg(unix)]
     let signal = {
         use tokio::signal::unix::{SignalKind, signal};
 
@@ -127,7 +127,7 @@ pub async fn wait_for_shutdown() {
         }
     };
 
-    #[cfg(target_env = "msvc")]
+    #[cfg(not(unix))]
     let signal = {
         match tokio::signal::ctrl_c().await {
             Ok(()) => "SIGINT",

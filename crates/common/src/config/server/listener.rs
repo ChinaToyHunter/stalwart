@@ -169,7 +169,7 @@ impl Listeners {
                 return;
             }
 
-            #[cfg(not(target_env = "msvc"))]
+            #[cfg(unix)]
             if let Err(err) = socket.set_reuseport(listener.socket_reuse_port) {
                 bp.build_error(id, format!("Failed to set SO_REUSEPORT: {err}"));
                 return;
