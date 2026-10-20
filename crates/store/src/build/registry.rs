@@ -28,6 +28,14 @@ const DEAD_NODE_TIMEOUT: u64 = 60 * 60 * 24; // 24 hours
 
 impl RegistryStore {
     pub async fn init(local: PathBuf) -> Result<Self, String> {
+        Self::init_with_mode(local, false).await
+    }
+
+    pub async fn init_for_import(local: PathBuf) -> Result<Self, String> {
+        Self::init_with_mode(local, true).await
+    }
+
+    async fn init_with_mode(local: PathBuf, import_mode: bool) -> Result<Self, String> {
         // Create inner store
         let mut inner = RegistryStoreInner::new(local);
 
@@ -36,6 +44,12 @@ impl RegistryStore {
             RegistryInit::Ok(data_store) => Store::build(data_store).await?,
             RegistryInit::Err(err) => return Err(err),
             RegistryInit::Bootstrap => {
+                if import_mode {
+                    return Err(
+                        "Import requires an existing persistent data store configuration"
+                            .to_string(),
+                    );
+                }
                 inner.env_recovery_mode = true;
 
                 if inner.env_recovery_admin.is_none() {
@@ -68,20 +82,36 @@ impl RegistryStore {
             }
         };
 
-        Self::from_inner(inner).await
+        if import_mode && inner.store.is_ephemeral() {
+            return Err("Import requires a configured persistent data store".to_string());
+        }
+        Self::from_inner_with_mode(inner, import_mode).await
     }
 
     pub fn from_inner_bootstrapped(inner: RegistryStoreInner) -> Self {
         Self(inner.into())
     }
 
-    pub async fn from_inner(mut inner: RegistryStoreInner) -> Result<Self, String> {
+    pub async fn from_inner(inner: RegistryStoreInner) -> Result<Self, String> {
+        Self::from_inner_with_mode(inner, false).await
+    }
+
+    async fn from_inner_with_mode(
+        mut inner: RegistryStoreInner,
+        import_mode: bool,
+    ) -> Result<Self, String> {
         // Create tables (SQL only)
         inner
             .store
             .create_tables()
             .await
             .map_err(|err| format!("Failed to create tables: {err}"))?;
+
+        // Import startup must leave registry primary-key subspace untouched. The restore
+        // command applies the same non-empty target guard before writing its first record.
+        if import_mode {
+            return Ok(Self(inner.into()));
+        }
 
         // Obtain node id
         let mut retry_count = 0;
@@ -333,5 +363,91 @@ impl RegistryStore {
         })
         .await
         .unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{SUBSPACE_REGISTRY_PK, write::AnyKey};
+
+    async fn registry_records(store: &Store) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut records = Vec::new();
+        store
+            .iterate(
+                IterateParams::new(
+                    AnyKey {
+                        subspace: SUBSPACE_REGISTRY_PK,
+                        key: vec![0],
+                    },
+                    AnyKey {
+                        subspace: SUBSPACE_REGISTRY_PK,
+                        key: vec![u8::MAX; 32],
+                    },
+                ),
+                |key, value| {
+                    records.push((key.to_vec(), value.to_vec()));
+                    Ok(true)
+                },
+            )
+            .await
+            .unwrap();
+        records
+    }
+
+    fn test_inner() -> RegistryStoreInner {
+        let mut inner = RegistryStoreInner::new(PathBuf::from("unused-test-config"));
+        inner.store = EphemeralStore::open();
+        inner.env_hostname = "test-host".to_string();
+        inner
+    }
+
+    #[tokio::test]
+    async fn import_mode_leaves_empty_registry_primary_key_subspace_empty() {
+        let inner = test_inner();
+        let registry = RegistryStore::from_inner_with_mode(inner, true)
+            .await
+            .unwrap();
+        assert!(registry_records(registry.store()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn import_mode_preserves_existing_registry_primary_key_entries() {
+        let inner = test_inner();
+        let store = inner.store.clone();
+        let mut batch = BatchBuilder::new();
+        batch.set(
+            ValueClass::NodeId(7),
+            KeySerializer::new(8 + "existing-host".len())
+                .write(1234u64)
+                .write("existing-host")
+                .finalize(),
+        );
+        store.write(batch.build_all()).await.unwrap();
+        let before = registry_records(&store).await;
+
+        let registry = RegistryStore::from_inner_with_mode(inner, true)
+            .await
+            .unwrap();
+        assert_eq!(registry_records(registry.store()).await, before);
+    }
+
+    #[tokio::test]
+    async fn normal_mode_creates_and_refreshes_node_lease() {
+        let inner = test_inner();
+        let registry = RegistryStore::from_inner_with_mode(inner, false)
+            .await
+            .unwrap();
+        let before = registry_records(registry.store()).await;
+        assert_eq!(before.len(), 1);
+        assert!(before[0].1.ends_with(b"test-host"));
+
+        registry.refresh_node_id_lease().await.unwrap();
+        let after = registry_records(registry.store()).await;
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].0, before[0].0);
+        assert!(after[0].1.ends_with(b"test-host"));
+        let renewal = |value: &[u8]| u64::from_be_bytes(value[..U64_LEN].try_into().unwrap());
+        assert!(renewal(&after[0].1) >= renewal(&before[0].1));
     }
 }
