@@ -121,11 +121,37 @@ impl BootManager {
             }
         }
 
-        // Initialize registry
-        let registry = RegistryStore::init(PathBuf::from(config_path.unwrap()))
-            .await
-            .failed("⚠️ Startup failed");
-        let mut bootstrap = Bootstrap::new(registry).await;
+        // Initialize registry. Import must not claim/renew a node lease before restore,
+        // because NodeId lives in the same primary-key subspace as imported registry data.
+        let is_import = matches!(import_export, StoreOp::Import(_));
+        let config_path = PathBuf::from(config_path.unwrap());
+        let registry = if is_import {
+            RegistryStore::init_for_import(config_path).await
+        } else {
+            RegistryStore::init(config_path).await
+        }
+        .failed("⚠️ Startup failed");
+        let mut bootstrap = if is_import {
+            // The target registry is empty until restore; cluster roles cannot be resolved yet.
+            Bootstrap::new_uninitialized(registry)
+        } else {
+            Bootstrap::new(registry).await
+        };
+
+        // Import only needs the configured data and blob stores for restore; do not
+        // parse the normal services or bind listeners.
+        if is_import {
+            let blob = store::BlobStore::build(&mut bootstrap)
+                .await
+                .failed("Failed to initialize blob store");
+            if bootstrap.has_fatal_errors || !bootstrap.errors.is_empty() {
+                failed("Import blob store configuration is invalid");
+            }
+            if let StoreOp::Import(path) = import_export {
+                super::restore::restore(bootstrap.data_store.clone(), blob, path).await;
+            }
+            std::process::exit(0);
+        }
 
         // Add safe defaults if missing
         if import_export == StoreOp::None {
@@ -252,17 +278,7 @@ impl BootManager {
                     .await;
                 std::process::exit(0);
             }
-            StoreOp::Import(path) => {
-                // Enable telemetry
-                telemetry.enable(false);
-
-                // Parse settings and restore
-                Box::pin(Core::parse(&mut bootstrap, storage))
-                    .await
-                    .restore(path)
-                    .await;
-                std::process::exit(0);
-            }
+            StoreOp::Import(_) => unreachable!("Import is handled before listener initialization"),
             StoreOp::Console => {
                 // Store console
                 store_console(

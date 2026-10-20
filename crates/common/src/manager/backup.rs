@@ -6,7 +6,7 @@
 
 use crate::Core;
 use ahash::AHashSet;
-use lz4_flex::frame::FrameEncoder;
+use lz4_flex::frame::{FrameEncoder, FrameInfo};
 use std::{
     io::{BufWriter, Write},
     path::{Path, PathBuf},
@@ -17,9 +17,12 @@ use store::{
     *,
 };
 use types::blob_hash::{BLOB_HASH_LEN, BlobHash};
-use utils::{UnwrapFailure, codec::leb128::Leb128_};
+use utils::{UnwrapFailure, codec::leb128::Leb128_, failed};
 
 pub(super) const MAGIC_MARKER: u8 = 123;
+
+/// Largest key or value accepted by the importer; exports refuse larger records.
+pub(super) const MAX_RECORD_LEN: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub(super) enum Family {
@@ -63,18 +66,7 @@ impl Core {
             .failed("Could not retrieve database schema version.");
 
         if params.families.is_empty() {
-            params.families = [
-                Family::Data,
-                Family::Registry,
-                Family::Blob,
-                Family::Changelog,
-                Family::Queue,
-                Family::Report,
-                Family::Telemetry,
-                Family::Tasks,
-            ]
-            .into_iter()
-            .collect();
+            params.families = Family::ALL.into_iter().collect();
         }
 
         for subspace in params
@@ -142,15 +134,20 @@ impl Core {
                     .failed("Failed to iterate over data store");
 
                 for hash in blobs {
-                    if let Some(blob) = blob_store
+                    // A backup that silently drops linked blobs cannot be restored faithfully.
+                    let Some(blob) = blob_store
                         .get_blob(hash.as_slice(), 0..usize::MAX)
                         .await
                         .failed("Failed to get blob")
-                    {
-                        writer
-                            .send((hash.as_slice().to_vec(), blob))
-                            .failed("Failed to send key");
-                    }
+                    else {
+                        failed(&format!(
+                            "Linked blob {} is missing from the blob store",
+                            hash.to_hex()
+                        ));
+                    };
+                    writer
+                        .send((hash.as_slice().to_vec(), blob))
+                        .failed("Failed to send key");
                 }
             }),
             handle,
@@ -236,7 +233,7 @@ impl Core {
 }
 
 #[allow(clippy::type_complexity)]
-fn spawn_writer(
+pub(super) fn spawn_writer(
     path: PathBuf,
     subspace: u8,
     version: u32,
@@ -246,15 +243,21 @@ fn spawn_writer(
     let handle = std::thread::spawn(move || {
         println!("Exporting database to {}.", path.to_str().unwrap());
 
-        let mut file = FrameEncoder::new(BufWriter::new(
-            std::fs::File::create(path).failed("Failed to create backup file"),
-        ));
+        // The content checksum and the end mark written by `finish` let the
+        // importer reject truncated or corrupted dumps before writing anything.
+        let mut file = FrameEncoder::with_frame_info(
+            FrameInfo::new().content_checksum(true),
+            BufWriter::new(std::fs::File::create(path).failed("Failed to create backup file")),
+        );
         file.write_all(&[MAGIC_MARKER, subspace])
             .failed("Failed to write version");
         file.write_all(&version.to_le_bytes())
             .failed("Failed to write version");
 
         while let Ok((key, value)) = rx.recv() {
+            if key.len() > MAX_RECORD_LEN || value.len() > MAX_RECORD_LEN {
+                failed("Backup record exceeds the import size limit");
+            }
             key.len()
                 .to_leb128_writer(&mut file)
                 .failed("Failed to write key value");
@@ -268,7 +271,12 @@ fn spawn_writer(
             }
         }
 
-        file.flush().failed("Failed to flush backup file");
+        file.finish()
+            .failed("Failed to finish backup file")
+            .into_inner()
+            .failed("Failed to flush backup file")
+            .sync_all()
+            .failed("Failed to sync backup file");
     });
 
     (handle, tx)
@@ -305,6 +313,17 @@ impl BackupParams {
 }
 
 impl Family {
+    pub(super) const ALL: [Family; 8] = [
+        Family::Data,
+        Family::Registry,
+        Family::Blob,
+        Family::Changelog,
+        Family::Queue,
+        Family::Report,
+        Family::Telemetry,
+        Family::Tasks,
+    ];
+
     pub fn subspaces(&self) -> &'static [u8] {
         match self {
             Family::Data => &[
