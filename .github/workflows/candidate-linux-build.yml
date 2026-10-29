@@ -18,7 +18,8 @@ env:
 jobs:
   build:
     name: Test and build (x86_64-unknown-linux-gnu)
-    runs-on: ubuntu-24.04
+    # The staging host runs Ubuntu 22.04 (glibc 2.35); newer runners link newer glibc symbols.
+    runs-on: ubuntu-22.04
     timeout-minutes: 150
     steps:
       - name: Checkout
@@ -51,6 +52,11 @@ jobs:
 
       - name: Package
         run: |
+          max_glibc=$(objdump -T target/release/stalwart | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
+          if [ "$(printf '%s\n' GLIBC_2.35 "$max_glibc" | sort -V | tail -1)" != GLIBC_2.35 ]; then
+            echo "binary requires $max_glibc, newer than the staging host's GLIBC_2.35"
+            exit 1
+          fi
           mkdir dist
           cp target/release/stalwart dist/stalwart
           {
@@ -58,6 +64,7 @@ jobs:
             echo "ref=$GITHUB_REF"
             echo "run=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
             echo "profile=release lto=false codegen-units=16 features=default"
+            echo "max_glibc=$max_glibc"
             rustc -Vv
             cargo -V
           } > dist/BUILD-INFO.txt
